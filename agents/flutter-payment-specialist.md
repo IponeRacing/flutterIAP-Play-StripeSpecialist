@@ -714,7 +714,692 @@ async function verifyGooglePurchase(packageName, productId, purchaseToken, isSub
 
 ---
 
-## 12. WORKING METHOD
+## 12. SERVER-SIDE VERIFICATION — BACKEND PATTERNS
+
+Always verify purchases server-side before granting entitlements.
+Choose the backend that matches your project:
+
+### 12.1 Supabase Edge Functions (recommended for Flutter + Supabase)
+
+```typescript
+// supabase/functions/verify-purchase/index.ts
+import { serve } from 'https://deno.land/std@0.177.0/http/server.ts';
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+
+serve(async (req) => {
+  const { platform, purchaseToken, jws, productId, userId } = await req.json();
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  );
+
+  let valid = false;
+  let expiresAt: string | null = null;
+
+  if (platform === 'ios') {
+    // Verify Apple JWS
+    const env = Deno.env.get('ENVIRONMENT') === 'production' ? '' : 'sandbox.';
+    const appleJWT = await createAppleSignedJWT(); // see below
+    const res = await fetch(
+      `https://api.${env}storekit.itunes.apple.com/inApps/v1/transactions/${extractTransactionId(jws)}`,
+      { headers: { Authorization: `Bearer ${appleJWT}` } },
+    );
+    if (res.ok) {
+      const data = await res.json();
+      valid = true;
+      expiresAt = data.signedTransactionInfo?.expiresDate
+        ? new Date(data.signedTransactionInfo.expiresDate).toISOString()
+        : null;
+    }
+  } else if (platform === 'android') {
+    // Verify Google Play via service account
+    const token = await getGoogleAccessToken(
+      Deno.env.get('GOOGLE_SERVICE_ACCOUNT_JSON')!,
+    );
+    const packageName = Deno.env.get('ANDROID_PACKAGE_NAME')!;
+    const isSubscription = productId.includes('monthly') || productId.includes('yearly');
+    const endpoint = isSubscription
+      ? `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${packageName}/purchases/subscriptionsv2/tokens/${purchaseToken}`
+      : `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${packageName}/purchases/products/${productId}/tokens/${purchaseToken}`;
+
+    const res = await fetch(endpoint, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      valid = isSubscription
+        ? data.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE'
+        : data.purchaseState === 0;
+      expiresAt = data.expiryTimeMillis
+        ? new Date(parseInt(data.expiryTimeMillis)).toISOString()
+        : null;
+    }
+  }
+
+  if (valid && userId) {
+    // Upsert entitlement in Supabase
+    await supabase.from('user_entitlements').upsert({
+      user_id: userId,
+      product_id: productId,
+      platform,
+      purchase_token: purchaseToken ?? jws,
+      expires_at: expiresAt,
+      is_active: true,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'user_id,product_id' });
+  }
+
+  return new Response(JSON.stringify({ valid, expiresAt }), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+});
+
+// Helper: create Apple Server-to-Server JWT
+async function createAppleSignedJWT(): Promise<string> {
+  // Requires: APPLE_KEY_ID, APPLE_ISSUER_ID, APPLE_PRIVATE_KEY (p8 content)
+  const header = { alg: 'ES256', kid: Deno.env.get('APPLE_KEY_ID')! };
+  const now = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: Deno.env.get('APPLE_ISSUER_ID')!,
+    iat: now,
+    exp: now + 3600,
+    aud: 'appstoreconnect-v1',
+    bid: Deno.env.get('APPLE_BUNDLE_ID')!,
+  };
+  // Use a JWT library or sign with WebCrypto API
+  // npm: https://deno.land/x/djwt
+  return '...'; // implement with djwt or similar
+}
+```
+
+**Flutter client call with Supabase:**
+```dart
+Future<bool> verifyWithSupabase(PurchaseDetails p) async {
+  final user = Supabase.instance.client.auth.currentUser;
+  final response = await Supabase.instance.client.functions.invoke(
+    'verify-purchase',
+    body: {
+      'platform': Platform.isIOS ? 'ios' : 'android',
+      'jws': Platform.isIOS ? p.verificationData.serverVerificationData : null,
+      'purchaseToken': Platform.isAndroid ? p.verificationData.serverVerificationData : null,
+      'productId': p.productID,
+      'userId': user?.id,
+    },
+  );
+  return response.data?['valid'] == true;
+}
+```
+
+**Supabase table:**
+```sql
+create table user_entitlements (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users not null,
+  product_id text not null,
+  platform text not null,           -- 'ios' | 'android'
+  purchase_token text,
+  expires_at timestamptz,           -- null for lifetime purchases
+  is_active boolean default true,
+  created_at timestamptz default now(),
+  updated_at timestamptz default now(),
+  unique (user_id, product_id)
+);
+
+-- RLS: users can only read their own entitlements
+alter table user_entitlements enable row level security;
+create policy "own entitlements" on user_entitlements
+  for select using (auth.uid() = user_id);
+```
+
+---
+
+### 12.2 Firebase Cloud Functions
+
+```typescript
+// functions/src/verifyPurchase.ts
+import * as functions from 'firebase-functions';
+import * as admin from 'firebase-admin';
+import { GoogleAuth } from 'google-auth-library';
+
+admin.initializeApp();
+
+export const verifyPurchase = functions.https.onCall(async (data, context) => {
+  if (!context.auth) throw new functions.https.HttpsError('unauthenticated', 'Login required');
+
+  const { platform, purchaseToken, jws, productId } = data;
+  const userId = context.auth.uid;
+
+  let valid = false;
+  let expiresAt: Date | null = null;
+
+  if (platform === 'ios') {
+    const appleJWT = await createAppleJWT();
+    const transactionId = decodeJWSTransactionId(jws);
+    const env = process.env.FUNCTIONS_EMULATOR ? 'sandbox.' : '';
+    const res = await fetch(
+      `https://api.${env}storekit.itunes.apple.com/inApps/v1/transactions/${transactionId}`,
+      { headers: { Authorization: `Bearer ${appleJWT}` } },
+    );
+    if (res.ok) {
+      valid = true;
+      const json = await res.json();
+      if (json.signedTransactionInfo?.expiresDate) {
+        expiresAt = new Date(json.signedTransactionInfo.expiresDate);
+      }
+    }
+  } else if (platform === 'android') {
+    const auth = new GoogleAuth({
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    });
+    const client = await auth.getClient();
+    const token = await client.getAccessToken();
+    const packageName = process.env.ANDROID_PACKAGE_NAME!;
+    const isSubscription = productId.includes('monthly') || productId.includes('yearly');
+
+    const url = isSubscription
+      ? `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${packageName}/purchases/subscriptionsv2/tokens/${purchaseToken}`
+      : `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${packageName}/purchases/products/${productId}/tokens/${purchaseToken}`;
+
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token.token}` } });
+    if (res.ok) {
+      const json = await res.json();
+      valid = isSubscription
+        ? json.subscriptionState === 'SUBSCRIPTION_STATE_ACTIVE'
+        : json.purchaseState === 0;
+      if (json.expiryTimeMillis) expiresAt = new Date(parseInt(json.expiryTimeMillis));
+    }
+  }
+
+  if (valid) {
+    // Store entitlement in Firestore
+    await admin.firestore().collection('entitlements').doc(userId).set({
+      [productId]: {
+        active: true,
+        platform,
+        expiresAt: expiresAt ? admin.firestore.Timestamp.fromDate(expiresAt) : null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    }, { merge: true });
+  }
+
+  return { valid, expiresAt: expiresAt?.toISOString() ?? null };
+});
+```
+
+**Flutter client call with Firebase:**
+```dart
+Future<bool> verifyWithFirebase(PurchaseDetails p) async {
+  final callable = FirebaseFunctions.instance.httpsCallable('verifyPurchase');
+  final result = await callable.call({
+    'platform': Platform.isIOS ? 'ios' : 'android',
+    'jws': Platform.isIOS ? p.verificationData.serverVerificationData : null,
+    'purchaseToken': Platform.isAndroid ? p.verificationData.serverVerificationData : null,
+    'productId': p.productID,
+  });
+  return result.data['valid'] == true;
+}
+
+// Check entitlement (Firestore, real-time)
+StreamSubscription checkEntitlementFirebase(String productId) {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance
+    .collection('entitlements')
+    .doc(uid)
+    .snapshots()
+    .listen((snap) {
+      final data = snap.data()?[productId];
+      final active = data?['active'] == true;
+      final expires = (data?['expiresAt'] as Timestamp?)?.toDate();
+      final hasAccess = active && (expires == null || expires.isAfter(DateTime.now()));
+      // Update local state
+    });
+}
+```
+
+---
+
+### 12.3 Self-hosted Node.js / Express
+
+```typescript
+// server.ts — minimal Express server
+import express from 'express';
+import { verifyAppleJWS, verifyGooglePurchase } from './iap-verify';
+
+const app = express();
+app.use(express.json());
+
+// POST /api/purchase/verify
+app.post('/api/purchase/verify', async (req, res) => {
+  const { platform, purchaseToken, jws, productId, userId } = req.body;
+
+  // Auth: verify your JWT/session token here
+  if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+
+  let valid = false;
+  let expiresAt: Date | null = null;
+
+  try {
+    if (platform === 'ios') {
+      const result = await verifyAppleJWS(jws);
+      valid = result.valid;
+      expiresAt = result.expiresAt;
+    } else if (platform === 'android') {
+      const result = await verifyGooglePurchase(
+        process.env.ANDROID_PACKAGE_NAME!,
+        productId,
+        purchaseToken,
+      );
+      valid = result.valid;
+      expiresAt = result.expiresAt;
+    }
+
+    if (valid) {
+      // Store in your DB (PostgreSQL / SQLite / MongoDB)
+      await db.upsert('entitlements', {
+        userId, productId, platform,
+        expiresAt, isActive: true, updatedAt: new Date(),
+      });
+    }
+
+    res.json({ valid, expiresAt: expiresAt?.toISOString() });
+  } catch (e) {
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+app.listen(3000);
+```
+
+---
+
+### 12.4 Environment Variables Reference
+
+| Variable | Used for | Where to get it |
+|---------|---------|----------------|
+| `APPLE_KEY_ID` | Sign Apple server JWTs | App Store Connect → Users → Keys |
+| `APPLE_ISSUER_ID` | Sign Apple server JWTs | App Store Connect → Users → Keys |
+| `APPLE_PRIVATE_KEY` | Sign Apple server JWTs | Download `.p8` file |
+| `APPLE_BUNDLE_ID` | Validate bundle | App Store Connect |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Verify Play purchases | Google Cloud Console → Service Accounts |
+| `ANDROID_PACKAGE_NAME` | Verify Play purchases | `applicationId` in `build.gradle` |
+| `STRIPE_SECRET_KEY` | Create Stripe PaymentIntents | Stripe Dashboard → Developers |
+| `STRIPE_WEBHOOK_SECRET` | Verify Stripe webhooks | Stripe Dashboard → Webhooks |
+
+---
+
+## 13. PRODUCTION-PROVEN PATTERNS (FROM REAL APPS)
+
+These patterns come from production Flutter + Supabase apps. Use them as the default architecture.
+
+### 13.1 UnifiedPremiumService — Singleton + ChangeNotifier + 5-min Cache
+
+The single source of truth for premium status across the entire app.
+Never query Supabase directly from UI widgets — always go through this service.
+
+```dart
+// lib/services/unified_premium_service.dart
+import 'package:flutter/foundation.dart';
+import 'subscription_service.dart';
+
+class UnifiedPremiumService extends ChangeNotifier {
+  static final UnifiedPremiumService _instance = UnifiedPremiumService._internal();
+  factory UnifiedPremiumService() => _instance;
+  UnifiedPremiumService._internal();
+
+  final SubscriptionService _subscriptionService = SubscriptionService();
+
+  Map<String, dynamic>? _cachedPlanInfo;
+  DateTime? _lastUpdate;
+  static const Duration _cacheValidityDuration = Duration(minutes: 5);
+
+  Future<void> initialize() async {
+    await _subscriptionService.initialize();
+    await _refreshPlanInfo();
+  }
+
+  bool get _isCacheValid {
+    if (_lastUpdate == null || _cachedPlanInfo == null) return false;
+    return DateTime.now().difference(_lastUpdate!) < _cacheValidityDuration;
+  }
+
+  Future<void> _refreshPlanInfo() async {
+    try {
+      _cachedPlanInfo = await _subscriptionService.getCurrentPlanInfo();
+      _lastUpdate = DateTime.now();
+      notifyListeners();
+    } catch (e) {
+      debugPrint('UnifiedPremiumService: refresh error $e');
+      // Falls back to free plan (see getPlanInfo default below)
+    }
+  }
+
+  /// Get current plan info — from cache if valid, otherwise refreshes
+  Future<Map<String, dynamic>> getPlanInfo() async {
+    if (!_isCacheValid) await _refreshPlanInfo();
+    return _cachedPlanInfo ?? {
+      'plan_type': 'free',
+      'plan_name': 'Gratuit',
+      'max_listings': 2,   // adapt to your app's free limit
+      'has_ads': true,
+      'can_upload_videos': false,
+      'expires_at': null,
+    };
+  }
+
+  Future<bool> get isPremium async {
+    final info = await getPlanInfo();
+    return info['plan_type'] != 'free';
+  }
+
+  Future<bool> get shouldShowAds async {
+    final info = await getPlanInfo();
+    return info['has_ads'] ?? true;
+  }
+
+  Future<int> get maxItems async {
+    final info = await getPlanInfo();
+    return info['max_items'] ?? 2;
+  }
+
+  Future<DateTime?> get expiryDate async {
+    final info = await getPlanInfo();
+    final str = info['expires_at'] as String?;
+    return str != null ? DateTime.tryParse(str) : null;
+  }
+
+  Future<int?> get daysRemaining async {
+    final expiry = await expiryDate;
+    if (expiry == null) return null;
+    final diff = expiry.difference(DateTime.now());
+    return diff.isNegative ? 0 : diff.inDays;
+  }
+
+  /// Call this IMMEDIATELY after a successful purchase/validation
+  Future<void> forceRefresh() async {
+    _cachedPlanInfo = null;
+    _lastUpdate = null;
+    await _refreshPlanInfo();
+  }
+
+  /// Returns usage warning string if user is near or at limit
+  Future<String?> getWarningMessage(int currentCount) async {
+    final info = await getPlanInfo();
+    final max = info['max_items'] as int? ?? 2;
+    if (max == -1) return null; // unlimited
+    if (currentCount >= max) return 'Limite atteinte ($currentCount/$max)';
+    if (currentCount / max >= 0.8) return '${max - currentCount} élément(s) restant(s)';
+    return null;
+  }
+}
+```
+
+**Usage in widget tree:**
+```dart
+// In main.dart — initialize before runApp
+await UnifiedPremiumService().initialize();
+
+// In any widget — listen to changes
+class _SomeScreenState extends State<SomeScreen> {
+  late final UnifiedPremiumService _premium;
+
+  @override
+  void initState() {
+    super.initState();
+    _premium = UnifiedPremiumService();
+    _premium.addListener(_onPremiumChanged);
+  }
+
+  void _onPremiumChanged() => setState(() {});
+
+  @override
+  void dispose() {
+    _premium.removeListener(_onPremiumChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder(
+      future: _premium.isPremium,
+      builder: (_, snap) => snap.data == true
+          ? const PremiumContent()
+          : const UpgradePrompt(),
+    );
+  }
+}
+```
+
+---
+
+### 13.2 GooglePlayValidationService — Supabase Edge Function
+
+Name the edge function after what it does on the platform.
+The function `validate-google-play-purchase` is called with `{user_id, product_id, purchase_token, platform}`.
+
+```dart
+// lib/services/google_play_validation_service.dart
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+class GooglePlayValidationService {
+  static final _supabase = Supabase.instance.client;
+
+  /// Calls the Supabase Edge Function to validate a Google Play purchase.
+  /// Returns the full response data on success, throws on failure.
+  static Future<Map<String, dynamic>> validatePurchase({
+    required String userId,
+    required String productId,
+    required String purchaseToken,
+  }) async {
+    final response = await _supabase.functions.invoke(
+      'validate-google-play-purchase',      // name your function explicitly
+      body: {
+        'user_id': userId,
+        'product_id': productId,
+        'purchase_token': purchaseToken,
+        'platform': 'android',
+      },
+    );
+
+    // New Supabase SDK: errors throw exceptions, no response.error field
+    final data = response.data as Map<String, dynamic>?;
+    if (data == null) throw Exception('Empty response from Edge Function');
+
+    final success = data['success'] as bool? ?? false;
+    if (!success) throw Exception(data['error'] ?? 'Validation failed');
+
+    return data;
+  }
+
+  /// Check active subscription directly against DB table (no Edge Function call)
+  static Future<bool> hasActiveSubscription(String userId) async {
+    final row = await _supabase
+        .from('premium_subscriptions')
+        .select('expires_at, status')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+
+    if (row == null) return false;
+    final expiresAt = DateTime.tryParse(row['expires_at'] as String? ?? '');
+    return expiresAt != null && DateTime.now().isBefore(expiresAt);
+  }
+
+  /// Get current subscription info from DB
+  static Future<SubscriptionInfo?> getCurrentSubscription(String userId) async {
+    final row = await _supabase
+        .from('premium_subscriptions')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('status', 'active')
+        .maybeSingle();
+
+    if (row == null) return null;
+    return SubscriptionInfo.fromJson(row);
+  }
+}
+```
+
+---
+
+### 13.3 SubscriptionInfo Model with Computed Properties
+
+```dart
+// lib/models/subscription_info.dart
+
+enum SubscriptionPlan {
+  free,
+  noPub,
+  plus,
+  premium;
+
+  static SubscriptionPlan fromString(String value) {
+    switch (value.toLowerCase()) {
+      case 'no_pub': return SubscriptionPlan.noPub;
+      case 'plus':   return SubscriptionPlan.plus;
+      case 'premium': return SubscriptionPlan.premium;
+      default:       return SubscriptionPlan.free;
+    }
+  }
+
+  String get displayName {
+    switch (this) {
+      case SubscriptionPlan.free:    return 'Gratuit';
+      case SubscriptionPlan.noPub:   return 'Sans Pub';
+      case SubscriptionPlan.plus:    return 'Plus';
+      case SubscriptionPlan.premium: return 'Premium';
+    }
+  }
+}
+
+class SubscriptionInfo {
+  final SubscriptionPlan plan;
+  final DateTime expiresAt;
+  final bool autoRenewing;
+
+  const SubscriptionInfo({
+    required this.plan,
+    required this.expiresAt,
+    required this.autoRenewing,
+  });
+
+  factory SubscriptionInfo.fromJson(Map<String, dynamic> json) {
+    return SubscriptionInfo(
+      plan: SubscriptionPlan.fromString(json['subscription_type'] ?? 'free'),
+      expiresAt: DateTime.parse(json['expires_at'] as String),
+      autoRenewing: json['auto_renewing'] as bool? ?? true,
+    );
+  }
+
+  bool get isActive => DateTime.now().isBefore(expiresAt);
+
+  bool get hasNoAds =>
+      plan == SubscriptionPlan.noPub ||
+      plan == SubscriptionPlan.plus ||
+      plan == SubscriptionPlan.premium;
+
+  /// Max items (-1 = unlimited). Adapt thresholds to your app.
+  int get maxItems {
+    switch (plan) {
+      case SubscriptionPlan.noPub:   return 2;
+      case SubscriptionPlan.plus:    return 5;
+      case SubscriptionPlan.premium: return -1; // unlimited
+      default:                       return 2;  // free
+    }
+  }
+
+  bool get isUnlimited => maxItems == -1;
+}
+```
+
+---
+
+### 13.4 premium_subscriptions Supabase Table (Production Schema)
+
+```sql
+-- This is the actual production schema pattern used with Flutter + Supabase
+create table premium_subscriptions (
+  id            uuid default gen_random_uuid() primary key,
+  user_id       uuid references auth.users not null,
+  subscription_type  text not null,           -- 'free' | 'no_pub' | 'plus' | 'premium'
+  platform      text not null,                -- 'android' | 'ios'
+  product_id    text,                         -- store product ID
+  purchase_token text,                        -- Play token or Apple original_transaction_id
+  status        text not null default 'active', -- 'active' | 'expired' | 'cancelled'
+  expires_at    timestamptz not null,
+  auto_renewing boolean default true,
+  created_at    timestamptz default now(),
+  updated_at    timestamptz default now(),
+  unique (user_id, platform)                  -- one active sub per platform per user
+);
+
+-- RLS: users read only their own row
+alter table premium_subscriptions enable row level security;
+create policy "own subscription" on premium_subscriptions
+  for select using (auth.uid() = user_id);
+
+-- The Edge Function uses service role key to write — no insert policy needed for clients
+```
+
+**Key patterns from production:**
+- Query `status = 'active'` AND `expires_at > now()` — both conditions required
+- Use `.maybeSingle()` — returns null instead of throwing when no row found
+- The Edge Function (`validate-google-play-purchase` / `validate-apple-iap`) writes using `service_role` key, bypassing RLS
+- After purchase → Edge Function upserts row → Flutter calls `UnifiedPremiumService.forceRefresh()`
+
+---
+
+### 13.5 Full Purchase → Validation → Entitlement Flow (Supabase)
+
+```dart
+// In IAPService._handlePurchases(), replace generic _verifyServerSide with:
+
+Future<void> _handlePurchases(List<PurchaseDetails> purchases) async {
+  for (final p in purchases) {
+    if (p.status == PurchaseStatus.purchased ||
+        p.status == PurchaseStatus.restored) {
+      try {
+        final userId = Supabase.instance.client.auth.currentUser?.id;
+        if (userId == null) throw Exception('Not authenticated');
+
+        if (Platform.isAndroid) {
+          await GooglePlayValidationService.validatePurchase(
+            userId: userId,
+            productId: p.productID,
+            purchaseToken: p.verificationData.serverVerificationData,
+          );
+        } else if (Platform.isIOS) {
+          await AppleIAPValidationService.validatePurchase(
+            userId: userId,
+            productId: p.productID,
+            jws: p.verificationData.serverVerificationData,
+          );
+        }
+
+        // Refresh premium status in the singleton (notifies all listeners)
+        await UnifiedPremiumService().forceRefresh();
+
+      } catch (e) {
+        debugPrint('Validation error: $e');
+        // Do NOT grant entitlement — let user retry
+      }
+    }
+
+    if (p.status == PurchaseStatus.error) {
+      debugPrint('Purchase error: ${p.error}');
+    }
+
+    // Always complete — never leave pending
+    if (p.pendingCompletePurchase) {
+      await InAppPurchase.instance.completePurchase(p);
+    }
+  }
+}
+```
+
+---
+
+## 14. WORKING METHOD
 
 When implementing IAP in a Flutter project:
 
