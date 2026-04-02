@@ -1429,3 +1429,291 @@ When implementing IAP in a Flutter project:
 - [ ] Android: Billing permission in `AndroidManifest.xml`
 - [ ] Tested with sandbox on real physical device (NOT emulator)
 - [ ] EU/App Store Review: no dark patterns, clear cancellation instructions
+- [ ] Products created via Fastlane or manually in both consoles (see Section 15)
+- [ ] StoreKit Configuration file created for local iOS simulator testing
+
+---
+
+## 15. FASTLANE IAP PRODUCT AUTOMATION
+
+Automate IAP product creation on both App Store Connect and Google Play Console
+using Fastlane custom lanes. This avoids manual console work and ensures
+products + localizations + pricing are consistent across stores.
+
+### 15.1 Centralized Product Definition
+
+Define all products once in a single JSON file, consumed by both iOS and Android lanes.
+
+```json
+// fastlane/iap_products.json
+[
+  {
+    "product_id": "hints_pack_10",
+    "ios_type": "CONSUMABLE",
+    "android_type": "managedUser",
+    "price_chf": 0.99,
+    "price_micros": "990000",
+    "reference_name": "Hints Pack 10",
+    "review_note": "Consumable: grants 10 hint tokens used to reveal letters in word puzzles.",
+    "localizations": {
+      "fr-FR": {
+        "title": "10 indices",
+        "description": "Pack de 10 indices pour vous aider dans vos parties."
+      },
+      "en-US": {
+        "title": "10 Hints",
+        "description": "Pack of 10 hints to help you in your games."
+      },
+      "de-DE": {
+        "title": "10 Hinweise",
+        "description": "Paket mit 10 Hinweisen, um Ihnen bei Ihren Spielen zu helfen."
+      }
+    }
+  }
+]
+```
+
+**Field reference:**
+
+| Field | iOS usage | Android usage |
+|-------|-----------|---------------|
+| `product_id` | `productId` in ASC API | `sku` in Play API |
+| `ios_type` | `CONSUMABLE` / `NON_CONSUMABLE` / `AUTO_RENEWABLE` | — |
+| `android_type` | — | `managedUser` (one-time) / `subs` (subscription) |
+| `price_chf` | Find matching price point ID | — |
+| `price_micros` | — | `defaultPrice.priceMicros` (price × 1,000,000) |
+| `reference_name` | `name` attribute | — |
+| `review_note` | `reviewNote` attribute | — |
+| `localizations` | `POST /v1/inAppPurchaseLocalizations` | `listings` object |
+
+### 15.2 Gemfile Dependencies
+
+```ruby
+# Gemfile
+source "https://rubygems.org"
+gem "fastlane", "~> 2.225"
+gem "jwt", "~> 2.9"          # Sign App Store Connect JWTs
+gem "googleauth", "~> 1.11"  # Google service account auth
+```
+
+Install with local path (avoids system gem permission issues):
+```bash
+bundle config set --local path 'vendor/bundle'
+bundle install
+```
+
+### 15.3 iOS Lane — App Store Connect API v2
+
+**Authentication:** ES256-signed JWT using the same P8 key used by Fastlane.
+
+```ruby
+# In Fastfile — JWT generation
+require 'jwt'
+
+def asc_jwt_token
+  key = OpenSSL::PKey::EC.new(File.read(SHARED_KEY_PATH))
+  payload = {
+    iss: SHARED_ISSUER_ID,
+    iat: Time.now.to_i,
+    exp: Time.now.to_i + 1200,   # 20-minute expiry
+    aud: "appstoreconnect-v1"
+  }
+  header = { kid: SHARED_API_KEY_ID }
+  JWT.encode(payload, key, "ES256", header)
+end
+```
+
+**Lane flow:**
+
+1. `GET /v1/apps?filter[bundleId]=com.your.app` → get `app_id`
+2. For each product:
+   - `POST /v2/inAppPurchases` → create IAP with `{ name, productId, inAppPurchaseType, reviewNote }`
+   - For each locale: `POST /v1/inAppPurchaseLocalizations` → `{ name, description, locale }`
+   - `GET /v2/inAppPurchases/{id}/pricePoints?filter[territory]=CHE` → find closest price point
+   - `POST /v1/inAppPurchasePriceSchedules` → set base price (auto-converts to all territories)
+
+**Key API endpoints (ASC API v2):**
+
+| Action | Method | Endpoint |
+|--------|--------|----------|
+| Find app | GET | `/v1/apps?filter[bundleId]={bundleId}` |
+| Create IAP | POST | `/v2/inAppPurchases` |
+| Find existing IAP | GET | `/v1/apps/{appId}/inAppPurchasesV2?filter[productId]={productId}` |
+| Add localization | POST | `/v1/inAppPurchaseLocalizations` |
+| Get price points | GET | `/v2/inAppPurchases/{iapId}/pricePoints?filter[territory]={territory}` |
+| Set price schedule | POST | `/v1/inAppPurchasePriceSchedules` |
+
+**Price schedule JSON structure:**
+
+```ruby
+price_body = {
+  data: {
+    type: "inAppPurchasePriceSchedules",
+    relationships: {
+      baseTerritory: {
+        data: { type: "territories", id: "CHE" }  # Base territory
+      },
+      inAppPurchase: {
+        data: { type: "inAppPurchases", id: iap_id }
+      },
+      manualPrices: {
+        data: [{ type: "inAppPurchasePrices", id: "${price1}" }]
+      }
+    }
+  },
+  included: [{
+    type: "inAppPurchasePrices",
+    id: "${price1}",
+    attributes: { startDate: nil, endDate: nil },
+    relationships: {
+      inAppPurchasePricePoint: {
+        data: { type: "inAppPurchasePricePoints", id: price_point_id }
+      },
+      inAppPurchaseV2: {
+        data: { type: "inAppPurchases", id: iap_id }
+      }
+    }
+  }]
+}
+```
+
+### 15.4 Android Lane — Google Play Developer API v3
+
+**Authentication:** Service account JSON via `googleauth` gem.
+
+```ruby
+require 'googleauth'
+
+authorizer = Google::Auth::ServiceAccountCredentials.make_creds(
+  json_key_io: File.open(SHARED_GOOGLE_JSON_KEY),
+  scope: "https://www.googleapis.com/auth/androidpublisher"
+)
+authorizer.fetch_access_token!
+access_token = authorizer.access_token
+```
+
+**Create product:**
+
+```ruby
+body = {
+  sku: product["product_id"],
+  status: "active",
+  purchaseType: product["android_type"],  # "managedUser" or "subs"
+  defaultLanguage: "fr-FR",
+  defaultPrice: {
+    priceMicros: product["price_micros"],  # e.g. "990000" for CHF 0.99
+    currency: "CHF"
+  },
+  listings: listings  # { "fr-FR" => { title, description }, ... }
+}
+
+# POST with autoConvertMissingPrices=true
+uri = URI("https://androidpublisher.googleapis.com/androidpublisher/v3/applications/#{package}/inappproducts?autoConvertMissingPrices=true")
+```
+
+**Key points:**
+- `autoConvertMissingPrices=true` — Google auto-converts CHF to all currencies
+- HTTP 409 = product exists → fall back to `PUT` to update
+- `price_micros` = price × 1,000,000 (e.g. CHF 3.99 → `"3990000"`)
+
+### 15.5 StoreKit Configuration File (Local iOS Testing)
+
+Create `ios/Runner/Products.storekit` for testing IAP in the iOS simulator
+without App Store Connect.
+
+```json
+{
+  "identifier": "com.your.bundleid",
+  "nonRenewingSubscriptions": [],
+  "products": [
+    {
+      "displayPrice": "0.99",
+      "familyShareable": false,
+      "internalID": "hints_pack_10_001",
+      "localizations": [
+        {
+          "description": "Pack of 10 hints to help you in your games.",
+          "displayName": "10 Hints",
+          "locale": "en"
+        },
+        {
+          "description": "Pack de 10 indices pour vous aider dans vos parties.",
+          "displayName": "10 indices",
+          "locale": "fr"
+        }
+      ],
+      "productID": "hints_pack_10",
+      "referenceName": "Hints Pack 10",
+      "type": "Consumable"
+    }
+  ],
+  "settings": {
+    "_applicationInternalID": "yourApp2026",
+    "_developerTeamID": "YOUR_TEAM_ID",
+    "_failTransactionsEnabled": false,
+    "_locale": "fr",
+    "_storefront": "CHE",
+    "_storeKitErrors": []
+  },
+  "subscriptionGroups": [],
+  "version": { "major": 4, "minor": 0 }
+}
+```
+
+**Setup in Xcode:**
+Edit Scheme → Run → Options → StoreKit Configuration → select `Products.storekit`
+
+**Product types in StoreKit config:**
+- `"Consumable"` — hints, coins
+- `"NonConsumable"` — remove ads, lifetime unlock
+- `"AutoRenewable"` — subscriptions (put in `subscriptionGroups` array)
+
+### 15.6 Price Auto-Conversion
+
+Both stores auto-convert from a single base price:
+
+| Feature | Apple | Google |
+|---------|-------|--------|
+| Mechanism | Global Equalization (price tiers) | `autoConvertMissingPrices=true` |
+| Base currency | Set via `baseTerritory` in price schedule | `defaultPrice.currency` |
+| Local rounding | Automatic (ends .99, .00, .90, .95 per locale) | Automatic ("Price Charming") |
+| Manual override | Per-territory price points in ASC | Per-currency in `prices` object |
+| What you define | 1 base price (e.g. CHF 0.99) | 1 base price (e.g. CHF 0.99) |
+| What stores generate | ~175 territory prices | ~60 currency prices |
+
+**No need to manage CHF/EUR/USD/GBP manually** — set one base price
+and the stores handle all conversions with proper local rounding conventions.
+
+### 15.7 Running the Lanes
+
+```bash
+# Create products on App Store Connect
+bundle exec fastlane ios create_iap
+
+# Create products on Google Play Console
+bundle exec fastlane android create_iap
+
+# Verify in consoles:
+# - App Store Connect → In-App Purchases → 4 products with localizations + prices
+# - Google Play Console → In-app products → 4 products with auto-converted prices
+```
+
+### 15.8 Flutter Product IDs Convention
+
+Keep product IDs in sync between `iap_products.json` and Flutter code:
+
+```dart
+// lib/config/product_ids.dart
+class ProductIds {
+  static const String hintsPack10 = 'hints_pack_10';
+  static const String hintsPack50 = 'hints_pack_50';
+  static const String removeAds   = 'remove_ads';
+  static const String starterPack = 'starter_pack';
+
+  static const Set<String> all = {hintsPack10, hintsPack50, removeAds, starterPack};
+  static const Set<String> consumables = {hintsPack10, hintsPack50};
+  static const Set<String> nonConsumables = {removeAds, starterPack};
+
+  static bool isConsumable(String id) => consumables.contains(id);
+}
+```
